@@ -1,0 +1,16 @@
+services:
+  hiby-remote:
+    build: .
+    image: hiby-remote
+    container_name: hiby-remote
+    # Host networking is needed for player discovery (UDP multicast 239.0.0.5:4001
+    # and broadcast :4003). Without it, type the player's IP in the UI.
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      WEB_PORT: "9000"
+      # Optional: connect to this player at startup and reconnect automatically.
+      HIBY_HOST: ""
+      HIBY_AUTO_RECONNECT: "1"
+      HIBY_DISCOVERY: "1"
+      HIBY_VERBOSE: "0"
