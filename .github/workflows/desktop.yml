@@ -1,0 +1,110 @@
+name: Desktop app
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - "apps/**"
+      - ".github/workflows/desktop.yml"
+  pull_request:
+    paths:
+      - "apps/**"
+      - ".github/workflows/desktop.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to attach the packages to a GitHub release on tags
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            package_task: ":desktopApp:packageDeb"
+          - name: Windows
+            os: windows-latest
+            package_task: ":desktopApp:packageMsi"
+    defaults:
+      run:
+        shell: bash
+        working-directory: apps
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Compute version
+        run: |
+          # The package version must be numeric MAJOR.MINOR.BUILD (MSI). Tags vX.Y.Z give X.Y.Z;
+          # other runs get 1.0.<run number> (see apps/desktopApp/build.gradle.kts).
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "VERSION_NAME=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          else
+            echo "VERSION_NAME=0.1.0-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          fi
+          echo "GITHUB_RUN_NUMBER=${{ github.run_number }}" >> "$GITHUB_ENV"
+
+      - name: Unit tests
+        run: ./gradlew --no-daemon :shared:desktopTest
+
+      - name: Package
+        run: ./gradlew --no-daemon :desktopApp:createDistributable ${{ matrix.package_task }}
+
+      - name: Collect artifacts (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          # The package version is the one computed in build.gradle.kts: read it back from the .deb name.
+          deb=$(ls desktopApp/build/compose/binaries/main/deb/*.deb)
+          ver=$(dpkg-deb -f "$deb" Version | sed 's/-[0-9]*$//')
+          mkdir -p dist
+          cp "$deb" "dist/hiby-remote_${ver}_amd64.deb"
+          tar -czf "dist/hiby-remote-${ver}-linux.tar.gz" -C desktopApp/build/compose/binaries/main/app hiby-remote
+
+      - name: Collect artifacts (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          msi=$(ls desktopApp/build/compose/binaries/main/msi/*.msi)
+          # hiby-remote-1.0.7.msi -> 1.0.7
+          ver=$(basename "$msi" .msi | sed 's/^hiby-remote-//')
+          mkdir -p dist
+          cp "$msi" "dist/hiby-remote-${ver}.msi"
+          (cd desktopApp/build/compose/binaries/main/app && 7z a -tzip "$GITHUB_WORKSPACE/apps/dist/hiby-remote-${ver}-windows.zip" hiby-remote)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hiby-remote-desktop-${{ runner.os }}
+          path: apps/dist/*
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: reports-${{ runner.os }}
+          path: apps/shared/build/reports/
+
+      - name: Publish release
+        # Android and desktop jobs publish to the same release concurrently: whoever comes
+        # first creates it, the others get "already exists" (ignored) and just upload.
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes 2>/dev/null || true
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber

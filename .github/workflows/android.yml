@@ -1,0 +1,102 @@
+name: Android APK
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - "apps/**"
+      - ".github/workflows/android.yml"
+  pull_request:
+    paths:
+      - "apps/**"
+      - ".github/workflows/android.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to attach the APK to a GitHub release on tags
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      HAS_KEYSTORE: ${{ secrets.HIBY_KEYSTORE_BASE64 != '' }}
+    defaults:
+      run:
+        working-directory: apps
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Compute version
+        run: |
+          # versionCode grows with every run; versionName comes from the tag when there is one.
+          echo "VERSION_CODE=${{ github.run_number }}" >> "$GITHUB_ENV"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "VERSION_NAME=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          else
+            echo "VERSION_NAME=0.1.0-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Decode release keystore
+        # Optional: set the repository secrets HIBY_KEYSTORE_BASE64, HIBY_KEYSTORE_PASSWORD,
+        # HIBY_KEY_ALIAS and HIBY_KEY_PASSWORD to sign the release APK with your own key.
+        # Without them, the release APK is signed with a throwaway debug key.
+        env:
+          KEYSTORE_BASE64: ${{ secrets.HIBY_KEYSTORE_BASE64 }}
+        if: env.HAS_KEYSTORE == 'true'
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "HIBY_KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+
+      - name: Unit tests
+        run: ./gradlew --no-daemon :shared:desktopTest
+
+      - name: Build APKs
+        env:
+          HIBY_KEYSTORE_PASSWORD: ${{ secrets.HIBY_KEYSTORE_PASSWORD }}
+          HIBY_KEY_ALIAS: ${{ secrets.HIBY_KEY_ALIAS }}
+          HIBY_KEY_PASSWORD: ${{ secrets.HIBY_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon :androidApp:assembleDebug :androidApp:assembleRelease :androidApp:lintRelease
+
+      - name: Rename APKs
+        run: |
+          mkdir -p dist
+          cp androidApp/build/outputs/apk/debug/androidApp-debug.apk "dist/hiby-remote-${VERSION_NAME}-debug.apk"
+          cp androidApp/build/outputs/apk/release/androidApp-release.apk "dist/hiby-remote-${VERSION_NAME}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hiby-remote-apk
+          path: apps/dist/*.apk
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: reports
+          path: |
+            apps/androidApp/build/reports/
+            apps/shared/build/reports/
+
+      - name: Publish release
+        # Android and desktop jobs publish to the same release concurrently: whoever comes
+        # first creates it, the others get "already exists" (ignored) and just upload.
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes 2>/dev/null || true
+          gh release upload "$GITHUB_REF_NAME" dist/*.apk --clobber
