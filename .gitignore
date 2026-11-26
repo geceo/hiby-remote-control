@@ -1,0 +1,8 @@
+# Original HiBy Music APK and its decompiled output: proprietary, never commit.
+base.apk
+*.apk
+jadx-out/
+__pycache__/
+
+# Build outputs collected by the Makefile.
+/dist/

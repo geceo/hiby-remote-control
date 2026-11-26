@@ -4,6 +4,10 @@ Reverse engineered from `base.apk` (HiBy Music, package `com.hiby.music`).
 Sources: Java package `com.hiby.music.smartlink.*` (jadx) and native
 `lib/arm64-v8a/libhibylink.so` (Ghidra, symbols not stripped).
 Static analysis only, not yet validated against a real device.
+The app also embeds the HiByLink **server** used by Android-based HiBy players
+(`smartlink/server`, `smartlink/service`), so player-side behavior below comes
+from that code. See [docs/APK_ANALYSIS.md](docs/APK_ANALYSIS.md) for the class
+map and the evidence behind each point.
 
 All multi-byte integers are **little endian**.
 
@@ -19,8 +23,8 @@ All multi-byte integers are **little endian**.
 | Address type | Transport | Details |
 |---|---|---|
 | 2 | WiFi | TCP `host:4001` (port overridable via `ip:port`), TCP_NODELAY, raw frame stream |
-| 1 | Bluetooth Classic | RFCOMM, insecure, service UUID `00002902-0000-1000-8000-00805f9b34fb` (fallback: channel 1), raw frame stream |
-| 8 | BLE | Service `0000c501-...-00805f9b34fb`, characteristic `00001001-...` (write + notify), MTU 20, chunked (see 2.2) |
+| 1 | Bluetooth Classic | RFCOMM, service UUID `00002902-0000-1000-8000-00805f9b34fb`, raw frame stream. Client: insecure socket (fallback `createRfcommSocket(1)`); player: **secure** `listenUsingRfcommWithServiceRecord("BT_SERVER", uuid)` |
+| 8 | BLE | Service `0000c501-...-00805f9b34fb`, one characteristic `00001001-...` (properties WRITE + INDICATE), MTU 20, chunked both ways (see 2.2) |
 
 ### 2.1 WiFi discovery
 
@@ -46,7 +50,21 @@ Binary beacon:
 
 Each link frame is cut into pieces of `mtu - 2` bytes, each prefixed by:
 `[seq:u8][len:u8]` where `seq` counts 0,1,2... and is `0xFF` for the last piece,
-and `len` = piece length + 2.
+and `len` = piece length + 2. The app registers BLE links with read and write
+MTU 20 (Wi-Fi and RFCOMM use 0 = no chunking), so this applies in both
+directions; the chunking is done in native code, the Java layer passes raw bytes.
+
+BLE details from the app:
+
+- Client: plain `connectGatt`, then `setCharacteristicNotification(char, true)`.
+  It never writes the CCCD descriptor; the player sends indications regardless.
+  Writes are acknowledged writes (with response), one at a time.
+- Player: advertises service UUID `0xC501`, its device name and manufacturer
+  data (company id 1740 = `0x06CC`) holding its Classic Bluetooth MAC. It sends
+  each piece with `notifyCharacteristicChanged(confirm = true)`, waits for
+  `onNotificationSent` and then **sleeps 400 ms** before the next piece (up to 13
+  retries). Downstream throughput is about 18 bytes / 400 ms (~45 B/s), so a
+  single signal takes seconds and covers are impractical.
 
 ### 2.3 Optional heartbeat
 
@@ -115,7 +133,9 @@ Body values are packed **without alignment** in signature order:
 
 Note: `GET_*` calls in the media-information service only return an ack;
 the actual values arrive as **signals** carrying the same action id. The server
-also pushes those signals spontaneously on state changes.
+also pushes those signals spontaneously on state changes (play state, mode,
+volume, meta, uuid, playlist name, cover, error code) and pushes **Progress
+every 800 ms while playing (1000 ms on BLE)**, so clients do not need to poll.
 
 ## 5. Session
 
@@ -139,13 +159,13 @@ Services: `0xC500` SDP, `0xC501` device info, `0xC502` media info,
 
 | id | name | inputs |
 |---|---|---|
-| 0x1201 | SetPlayState | `y` 1=play, 2=pause, 3=stop |
+| 0x1201 | SetPlayState | `y` 1=play, 2=pause, 3=stop (other values ignored) |
 | 0x1202 | SetPlayMode | `y` 1=order, 2=repeat all, 3=repeat one, 4=shuffle |
-| 0x1203 | SetVolume | `y` level (0..MaxVolume) |
+| 0x1203 | SetVolume | `y` level (0..MaxVolume; Android players: music stream index) |
 | 0x1204 | PlayUuid | `s` list uri, `s` song uuid (see "Playing specific content") |
 | 0x1205 | PlayPrevious | - |
 | 0x1206 | PlayNext | - |
-| 0x1207 | SetProgress | `u` position (unit presumably ms) |
+| 0x1207 | SetProgress | `u` position in ms |
 | 0x1208 | SetFileInit | `s` name, `u` size |
 | 0x1209 | SetFileData | `ay` chunk |
 | 0x120A | PlayTrackUuid | `s` dir uri, `s` file path, `s` track uuid |
@@ -161,10 +181,10 @@ Services: `0xC500` SDP, `0xC501` device info, `0xC502` media info,
 
 | id | name | signal value |
 |---|---|---|
-| 0x1101 | PlayState | `y` |
-| 0x1102 | PlayMode | `y` |
-| 0x1103 | Progress | `u` |
-| 0x1104 | Cover | `ay` (image) |
+| 0x1101 | PlayState | `y` 1 playing, 2 paused, 3 stopped, 4 preparing, 5 error |
+| 0x1102 | PlayMode | `y` 1 order, 2 repeat all, 3 repeat one, 4 shuffle |
+| 0x1103 | Progress | `u` ms |
+| 0x1104 | Cover | `ay` JPEG (quality 100, scaled to 720x720 when larger); empty when none |
 | 0x1105 | Volume | `y` |
 | 0x1106 | CurPlaylistName | `s` |
 | 0x1107 | CurPlayUuid | `s` |
@@ -202,7 +222,7 @@ Struct field order (recovered from the JNI constructor calls):
   For the storage roots, `name` = path and `uuid` = `"<totalGB>-<freeGB>"`.
 - **Track** `a(ssq)`: name, uuid, number
 - **Meta** `a(sssssssuuuuqyyy)`: title, artist, album, year, genre, file path,
-  note, duration, file size, bitrate, sample rate, format (q), sample bits,
+  note, duration (**ms**), file size, bitrate, sample rate, format (q), sample bits,
   channels, quality
 
 #### Library URIs
